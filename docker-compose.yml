@@ -1,0 +1,38 @@
+services:
+  rtmp:
+    build:
+      context: .
+      dockerfile: Dockerfile.nginx
+    ports:
+      - "1935:1935"
+      - "8080:8080"
+    volumes:
+      - hls-data:/tmp/hls
+      - recordings:/var/recordings
+    restart: unless-stopped
+    depends_on:
+      - telemetry
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  telemetry:
+    build:
+      context: .
+      dockerfile: Dockerfile.telemetry
+    expose:
+      - "3000"
+    volumes:
+      - recordings:/var/recordings
+      - ./oauth-client.json:/app/oauth-client.json:ro
+      - ./oauth-token.json:/app/oauth-token.json:ro
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+volumes:
+  hls-data:
+  recordings:

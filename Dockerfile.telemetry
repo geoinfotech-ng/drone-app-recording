@@ -1,0 +1,22 @@
+FROM node:20-alpine
+
+WORKDIR /app
+
+# Install ffmpeg
+RUN apk add --no-cache ffmpeg
+
+# Copy package.json first
+COPY server/package.json ./
+
+# Install dependencies
+RUN npm install --production
+
+# Copy app source
+COPY server/telemetry.js ./
+
+# Create recordings dir
+RUN mkdir -p /var/recordings
+
+EXPOSE 3000
+
+CMD ["node", "telemetry.js"]

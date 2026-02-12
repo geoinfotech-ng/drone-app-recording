@@ -1,0 +1,9 @@
+{
+  "name": "drone-telemetry-relay",
+  "version": "2.0.0",
+  "main": "telemetry.js",
+  "dependencies": {
+    "ws": "^8.16.0",
+    "googleapis": "^131.0.0"
+  }
+}
