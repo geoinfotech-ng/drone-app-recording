@@ -1,8 +1,8 @@
 const http = require('http');
-const { WebSocketServer, WebSocket } = require('ws');
+const { WebSocketServer } = require('ws');
 const fs = require('fs');
 const path = require('path');
-const { execFile } = require('child_process');
+const { spawn } = require('child_process');
 const { google } = require('googleapis');
 
 const PORT = 3000;
@@ -14,7 +14,9 @@ const OAUTH_TOKEN_PATH  = '/app/oauth-token.json';
 
 let driveClient = null;
 
-// ─── Google Drive OAuth ─────────────────────────
+// ───────────────────────────────────────────────
+// GOOGLE DRIVE (OAuth)
+// ───────────────────────────────────────────────
 function initGoogleDrive() {
   try {
     if (!fs.existsSync(OAUTH_CLIENT_PATH) || !fs.existsSync(OAUTH_TOKEN_PATH)) {
@@ -40,19 +42,21 @@ function initGoogleDrive() {
       auth: oAuth2Client
     });
 
-    console.log('[GDRIVE] OAuth client initialized — auto-upload enabled');
+    console.log('[GDRIVE] OAuth initialized — auto-upload enabled');
+
   } catch (err) {
     console.error('[GDRIVE] Init error:', err.message);
   }
 }
 
 async function uploadToGoogleDrive(filePath) {
-  if (!driveClient) return null;
+  if (!driveClient) return;
 
   const fileName = path.basename(filePath);
-  const sizeMB = (fs.statSync(filePath).size / (1024 * 1024)).toFixed(2);
+  const stat = fs.statSync(filePath);
+  const sizeMB = (stat.size / (1024 * 1024)).toFixed(2);
 
-  console.log(`[GDRIVE] Uploading ${fileName} (${sizeMB} MB)...`);
+  console.log(`[GDRIVE] Uploading ${fileName} (${sizeMB} MB)`);
 
   try {
     const res = await driveClient.files.create({
@@ -68,56 +72,54 @@ async function uploadToGoogleDrive(filePath) {
     });
 
     console.log(`[GDRIVE] Done: ${res.data.name}`);
-    return res.data;
-
   } catch (err) {
     console.error('[GDRIVE] Upload failed:', err.message);
-    return null;
   }
 }
 
-// ─── FLV → MP4 Conversion ───────────────────────
+// ───────────────────────────────────────────────
+// FLV → MP4 CONVERSION (STREAM SAFE)
+// ───────────────────────────────────────────────
 function convertToMp4(flvPath) {
-  return new Promise(resolve => {
+  return new Promise((resolve) => {
 
     const mp4Path = flvPath.replace(/\.flv$/, '.mp4');
 
     console.log(`[CONVERT] ${path.basename(flvPath)} → MP4`);
 
-    execFile('ffmpeg', [
+    const ffmpeg = spawn('ffmpeg', [
       '-y',
+      '-loglevel', 'error',
       '-i', flvPath,
       '-c', 'copy',
       '-movflags', '+faststart',
       mp4Path
-    ], (err) => {
+    ]);
 
-      if (err) {
-        console.error('[CONVERT] Failed:', err.message);
-        resolve(null);
-      } else {
+    ffmpeg.stderr.on('data', data => {
+      // Only errors printed due to loglevel
+      console.error('[CONVERT]', data.toString().trim());
+    });
+
+    ffmpeg.on('close', (code) => {
+      if (code === 0) {
         console.log(`[CONVERT] Done: ${path.basename(mp4Path)}`);
         resolve(mp4Path);
+      } else {
+        console.error('[CONVERT] Failed with exit code', code);
+        resolve(null);
       }
     });
+
   });
 }
 
-// ─── State ──────────────────────────────────────
-let drone = null;
-let viewers = new Set();
-let lastTelemetry = null;
+// ───────────────────────────────────────────────
+// RECORDING WATCHER
+// ───────────────────────────────────────────────
 let activeRecording = null;
-let processedFiles = new Set();
+let processed = new Set();
 
-function broadcastToViewers(data) {
-  const msg = JSON.stringify(data);
-  viewers.forEach(v => {
-    if (v.readyState === WebSocket.OPEN) v.send(msg);
-  });
-}
-
-// ─── Recording Watcher ──────────────────────────
 function scanRecordings() {
 
   if (!fs.existsSync(RECORDINGS_DIR)) return;
@@ -127,89 +129,65 @@ function scanRecordings() {
     .map(f => {
       const fp = path.join(RECORDINGS_DIR, f);
       const stat = fs.statSync(fp);
-      return { name: f, path: fp, size: stat.size, mtime: stat.mtimeMs };
+      return {
+        name: f,
+        path: fp,
+        size: stat.size,
+        mtime: stat.mtimeMs
+      };
     });
 
   const now = Date.now();
-  const growing = files.find(f => (now - f.mtime) < 3000 && f.size > 0);
+  const growing = files.find(f => (now - f.mtime) < 5000 && f.size > 0);
 
   if (growing && !activeRecording) {
-    activeRecording = {
-      startTime: new Date().toISOString(),
-      filename: growing.name
-    };
-    console.log(`[RECORD] Recording started: ${growing.name}`);
+    activeRecording = growing.name;
+    console.log(`[RECORD] Started: ${growing.name}`);
   }
 
   if (!growing && activeRecording) {
 
-    const completed = files.find(f => f.name === activeRecording.filename);
+    const completed = files.find(f => f.name === activeRecording);
 
-    if (completed && !processedFiles.has(completed.name)) {
+    if (completed && !processed.has(completed.name)) {
 
-      processedFiles.add(completed.name);
+      processed.add(completed.name);
 
-      console.log(`[RECORD] Recording stopped: ${completed.name}`);
+      console.log(`[RECORD] Stopped: ${completed.name}`);
 
-      convertToMp4(completed.path).then(mp4Path => {
+      convertToMp4(completed.path)
+        .then(mp4Path => {
 
-        const uploadPath = mp4Path || completed.path;
+          const finalPath = mp4Path || completed.path;
 
-        uploadToGoogleDrive(uploadPath);
+          return uploadToGoogleDrive(finalPath);
 
-      });
+        })
+        .catch(err => {
+          console.error('[PIPELINE] Error:', err.message);
+        });
     }
 
     activeRecording = null;
   }
 }
 
-setInterval(scanRecordings, 2000);
+setInterval(scanRecordings, 3000);
 
-// ─── HTTP Server ────────────────────────────────
-const httpServer = http.createServer((req, res) => {
-
-  const url = new URL(req.url, `http://${req.headers.host}`);
-
-  if (url.pathname === '/api/recording-status') {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    return res.end(JSON.stringify({
-      isRecording: !!activeRecording,
-      gdriveEnabled: !!driveClient
-    }));
-  }
-
+// ───────────────────────────────────────────────
+// HTTP + WS
+// ───────────────────────────────────────────────
+const server = http.createServer((req, res) => {
   res.writeHead(404);
   res.end();
 });
 
-// ─── WebSocket ──────────────────────────────────
-const wss = new WebSocketServer({ server: httpServer });
+const wss = new WebSocketServer({ server });
 
-wss.on('connection', (ws, req) => {
+wss.on('connection', () => {});
 
-  const url = new URL(req.url, `http://${req.headers.host}`);
-  const role = url.searchParams.get('role');
-
-  if (role === 'drone') {
-    drone = ws;
-    ws.on('message', data => {
-      try {
-        const telemetry = JSON.parse(data);
-        lastTelemetry = telemetry;
-        broadcastToViewers(telemetry);
-      } catch {}
-    });
-    ws.on('close', () => { drone = null; });
-  } else {
-    viewers.add(ws);
-    if (lastTelemetry) ws.send(JSON.stringify(lastTelemetry));
-    ws.on('close', () => viewers.delete(ws));
-  }
-});
-
-// ─── Start ──────────────────────────────────────
 initGoogleDrive();
-httpServer.listen(PORT, () => {
-  console.log(`[TELEMETRY] Server on :${PORT}`);
+
+server.listen(PORT, () => {
+  console.log(`[TELEMETRY] Server running on ${PORT}`);
 });
